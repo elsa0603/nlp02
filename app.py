@@ -1,202 +1,240 @@
-# Streamlit + yfinance：輕量股價儀表板
-# -------------------------------------------------------------
-# 使用方式：
-# 1) 安裝套件：pip install streamlit yfinance plotly pandas
-# 2) 執行：streamlit run app.py
-# -------------------------------------------------------------
 
-import datetime as dt
-from typing import List, Dict
-
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
+import pandas as pd
+import torch
+from sentence_transformers import SentenceTransformer
+import faiss
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
+from threading import Thread
 
-st.set_page_config(page_title="Stock Dashboard (yfinance)", layout="wide")
+st.set_page_config(page_title="中文客服生成 (RAG + 指令微調模型)", page_icon="💬", layout="wide")
 
-# -----------------------------
-# Sidebar：參數
-# -----------------------------
-st.sidebar.title("設定")
-compare_mode = st.sidebar.checkbox("多標的比較 (標準化到同一起點)", value=False)
+# -----------------------
+# Sidebar: 模型 & 參數
+# -----------------------
+with st.sidebar:
+    st.markdown("## 模型設定")
+    model_id = st.text_input(
+        "Hugging Face 模型（建議：Qwen/Qwen2.5-0.5B-Instruct 或 1.5B）",
+        value="Qwen/Qwen2.5-0.5B-Instruct"
+    )
+    use_4bit = st.checkbox("使用 4-bit 量化（需安裝 bitsandbytes；雲端不一定支援）", value=False)
+    max_new_tokens = st.slider("回覆長度 (max_new_tokens)", 64, 1024, 256, 16)
+    temperature = st.slider("溫度 (temperature)", 0.0, 1.5, 0.3, 0.1)
+    top_p = st.slider("Top-p", 0.1, 1.0, 0.9, 0.05)
+    st.divider()
+    st.markdown("### 檢索設定")
+    top_k = st.slider("取回知識條目數 (top_k)", 1, 10, 3, 1)
+    use_query_rewrite = st.checkbox("先重寫用戶問題（可提升檢索準確度）", value=True)
 
-if compare_mode:
-    tickers: List[str] = st.sidebar.text_input(
-        "輸入代號 (逗號分隔)",
-        value="AAPL, TSLA, NVDA",
-        help="例如：AAPL, TSLA 或 ^TWII, 2330.TW (台積電)"
-    ).replace(" ", "").split(",")
-else:
-    ticker = st.sidebar.text_input(
-        "單一代號",
-        value="AAPL",
-        help="例如：AAPL、TSLA、NVDA、2330.TW、^GSPC"
-    ).strip()
-    tickers = [ticker]
+st.title("💬 中文客服生成 (RAG + 指令模型)")
+st.caption("上傳 FAQ/知識庫 → 檢索 → 注入模型提示 → 產生客服回覆。預設支援中文。")
 
-# 日期區間
-end_date = st.sidebar.date_input("結束日", dt.date.today())
-start_default = end_date - dt.timedelta(days=365)
-start_date = st.sidebar.date_input("開始日", start_default)
-
-# K 線間隔
-interval = st.sidebar.selectbox(
-    "取樣頻率 (interval)",
-    options=["1d", "1wk", "1mo"],
-    index=0,
-    help="日/週/月資料"
+# -----------------------
+# 內建小型FAQ示範
+# -----------------------
+DEFAULT_FAQ = pd.DataFrame(
+    [
+        {"question":"你們的營業時間是？","answer":"我們的客服時間為週一至週五 09:00–18:00（國定假日除外）。"},
+        {"question":"如何申請退貨？","answer":"請於到貨 7 天內透過訂單頁面點選『申請退貨』，系統將引導您完成流程。"},
+        {"question":"運費如何計算？","answer":"單筆訂單滿 NT$ 1000 免運，未滿則酌收 NT$ 80。"},
+        {"question":"可以開立發票嗎？","answer":"我們提供電子發票，請於結帳時填寫統一編號與抬頭。"},
+    ]
 )
 
-# 移動平均參數
-ma_1 = st.sidebar.number_input("MA 窗口1", min_value=2, max_value=250, value=20)
-ma_2 = st.sidebar.number_input("MA 窗口2", min_value=2, max_value=500, value=50)
-show_volume = st.sidebar.checkbox("顯示成交量", value=True)
+# -----------------------
+# Session state
+# -----------------------
+if "faq_df" not in st.session_state:
+    st.session_state.faq_df = DEFAULT_FAQ.copy()
+if "index" not in st.session_state:
+    st.session_state.index = None
+if "embedder" not in st.session_state:
+    st.session_state.embedder = None
+if "model" not in st.session_state:
+    st.session_state.model = None
+    st.session_state.tokenizer = None
+if "history" not in st.session_state:
+    st.session_state.history = []  # list of dicts: {"role":"user/assistant", "content":str}
 
-def _valid_range(s: dt.date, e: dt.date):
-    if s >= e:
-        st.sidebar.error("開始日需早於結束日")
-        return False
-    return True
+# -----------------------
+# 上傳 FAQ/知識庫
+# -----------------------
+st.subheader("步驟1：上傳 FAQ / 知識庫 (CSV)")
+st.write("需要兩欄：`question, answer`（UTF-8）。若未上傳，會使用示範資料。")
+uploaded = st.file_uploader("上傳 CSV", type=["csv"])
+if uploaded is not None:
+    try:
+        df = pd.read_csv(uploaded)
+        assert set(["question", "answer"]).issubset(df.columns), "CSV 需包含 question 與 answer 欄位"
+        st.session_state.faq_df = df.dropna().reset_index(drop=True)
+        st.success(f"已載入 {len(df)} 筆 FAQ。")
+    except Exception as e:
+        st.error(f"讀取CSV失敗：{e}")
 
-# -----------------------------
-# 下載資料（有 cache）
-# -----------------------------
-@st.cache_data(ttl=3600)
-def load_prices(_tickers: List[str], start: dt.date, end: dt.date, interval: str) -> Dict[str, pd.DataFrame]:
-    out: Dict[str, pd.DataFrame] = {}
-    for t in _tickers:
-        try:
-            df = yf.download(
-                t,
-                start=start,
-                end=end + dt.timedelta(days=1),  # 包含 end 當日
-                interval=interval,
-                auto_adjust=True,
-                progress=False,
-            )
-            if not df.empty:
-                df.index = pd.to_datetime(df.index)
-                df["MA1"] = df["Close"].rolling(ma_1).mean()
-                df["MA2"] = df["Close"].rolling(ma_2).mean()
-                out[t] = df
-        except Exception as ex:
-            st.warning(f"下載 {t} 失敗：{ex}")
-    return out
+with st.expander("查看目前 FAQ 資料", expanded=False):
+    st.dataframe(st.session_state.faq_df, use_container_width=True)
 
-# -----------------------------
-# 主區塊：標題 & 數據
-# -----------------------------
-st.title("📈 yfinance 股價儀表板")
+# -----------------------
+# 建立向量索引
+# -----------------------
+st.subheader("步驟2：建立/更新 檢索索引")
+if st.button("建立索引 / 重新索引"):
+    with st.spinner("正在建立向量索引..."):
+        # 多語模型，支援中文
+        st.session_state.embedder = SentenceTransformer("intfloat/multilingual-e5-small")
+        # e5 small 用法：需要在前面加上 "query: " / "passage: "
+        corpus = ["passage: " + str(q) + " " + str(a) for q, a in zip(st.session_state.faq_df["question"], st.session_state.faq_df["answer"])]
+        emb = st.session_state.embedder.encode(corpus, convert_to_numpy=True, show_progress_bar=True, normalize_embeddings=True)
+        dim = emb.shape[1]
+        index = faiss.IndexFlatIP(dim)  # 內積=cosine (因已 normalize)
+        index.add(emb)
+        st.session_state.index = index
+    st.success("索引完成！")
 
-if _valid_range(start_date, end_date):
-    data = load_prices(tickers, start_date, end_date, interval)
-
-    if not data:
-        st.info("查無資料，請更換代號或時間區間。")
-        st.stop()
-
-    # 多標的比較：折線圖 (標準化到 100)
-    if compare_mode:
-        st.subheader("多標的走勢比較 (基準=100)")
-        norm_df = pd.DataFrame()
-        for t, df in data.items():
-            if df.empty:
-                continue
-            base = df["Close"].iloc[0]
-            series = (df["Close"] / base) * 100
-            norm_df[t] = series
-        st.line_chart(norm_df)
-
-    # 單一標的：K 線 + MA + 成交量
-    else:
-        t = tickers[0]
-        df = data.get(t)
-        if df is None or df.empty:
-            st.info("查無資料，請更換代號或時間區間。")
-            st.stop()
-
-        st.subheader(f"{t} 價格走勢（{interval}）")
-
-        fig = go.Figure()
-        # K 線
-        fig.add_trace(go.Candlestick(
-            x=df.index,
-            open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-            name="OHLC"
-        ))
-        # MA 線
-        fig.add_trace(go.Scatter(x=df.index, y=df["MA1"], name=f"MA{ma_1}", mode="lines"))
-        fig.add_trace(go.Scatter(x=df.index, y=df["MA2"], name=f"MA{ma_2}", mode="lines"))
-
-        fig.update_layout(
-            height=520,
-            margin=dict(l=20, r=20, t=40, b=20),
-            xaxis_title="日期",
-            yaxis_title="價格",
+# -----------------------
+# 載入文字生成模型
+# -----------------------
+st.subheader("步驟3：載入文字生成模型")
+def load_model_tokenizer(model_id: str, use_4bit: bool=False):
+    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    if use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
         )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, device_map="auto", quantization_config=bnb_config, trust_remote_code=True
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, device_map="auto", torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            trust_remote_code=True
+        )
+    return tokenizer, model
 
-        st.plotly_chart(fig, use_container_width=True)
+if st.button("載入/更新 模型"):
+    with st.spinner("正在載入模型與權重...（首次載入需較久）"):
+        try:
+            tok, mdl = load_model_tokenizer(model_id, use_4bit)
+            st.session_state.tokenizer = tok
+            st.session_state.model = mdl
+            st.success(f"已載入：{model_id}")
+        except Exception as e:
+            st.error(f"載入失敗：{e}")
 
-        # 成交量 (獨立圖)
-        if show_volume:
-            vol = go.Figure()
-            vol.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume"))
-            vol.update_layout(height=200, margin=dict(l=20, r=20, t=10, b=20))
-            st.plotly_chart(vol, use_container_width=True)
+# -----------------------
+# 檢索輔助：重寫查詢（選用）
+# -----------------------
+def rewrite_query(q: str) -> str:
+    # 簡單啟發式重寫：移除贅詞、繁簡混合清理，可換成小模型生成（此處保持離線）
+    q = q.strip()
+    for t in ["請問", "麻煩", "一下", "可以", "能否", "想問", "謝謝", "謝了", "哈囉", "您好", "你好"]:
+        q = q.replace(t, "")
+    return q
 
-        # 指標卡片
-        # 指標卡片
-        col1, col2, col3, col4 = st.columns(4)
-        last_close = float(df["Close"].iloc[-1])
-        ret = float(((df["Close"].iloc[-1] / df["Close"].iloc[0]) - 1) * 100)
-        hi_ = float(df["High"].max())
-        lo_ = float(df["Low"].min())
-        vol_std = float(df["Close"].pct_change().std() * (252 ** 0.5) * 100)
+# -----------------------
+# 產生回覆（流式）
+# -----------------------
+def generate_stream(prompt, max_new_tokens=256, temperature=0.3, top_p=0.9):
+    tok = st.session_state.tokenizer
+    mdl = st.session_state.model
+    inputs = tok(prompt, return_tensors="pt").to(mdl.device)
+    streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+    gen_kwargs = dict(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=True if temperature > 0 else False,
+        temperature=temperature,
+        top_p=top_p,
+        streamer=streamer
+    )
+    thread = Thread(target=mdl.generate, kwargs=gen_kwargs)
+    thread.start()
+    partial = ""
+    for new_text in streamer:
+        partial += new_text
+        yield partial
 
-        col1.metric("最新收盤", f"{last_close:,.2f}")
-        col2.metric("區間報酬(%)", f"{ret:,.2f}")
-        col3.metric("區間最高", f"{hi_:,.2f}")
-        col4.metric("區間最低", f"{lo_:,.2f}")
-        st.caption(f"年化波動率(近似)：{vol_std:.2f}%")
+# -----------------------
+# Chat 區塊
+# -----------------------
+st.subheader("步驟4：開始對話")
+user_input = st.text_input("輸入您的問題（中文）", placeholder="例如：想退貨要怎麼做？")
 
-        # 原始資料表 & 下載
-        with st.expander("查看原始資料表 / 下載 CSV"):
-            st.dataframe(df)
-            csv = df.to_csv(index=True).encode("utf-8-sig")
-            st.download_button(
-                label="下載 CSV",
-                data=csv,
-                file_name=f"{t}_{start_date}_{end_date}_{interval}.csv",
-                mime="text/csv",
-            )
+col1, col2 = st.columns([3,1])
+with col1:
+    send = st.button("送出", use_container_width=True)
+with col2:
+    clear = st.button("清除對話", use_container_width=True)
 
-    # 批次下載（多標的）
-    with st.expander("批次下載（所有輸入的標的）"):
-        # 以 Excel 打包多工作表
-        if data:
-            from io import BytesIO
-            buff = BytesIO()
-            with pd.ExcelWriter(buff, engine="xlsxwriter") as writer:
-                for t, df in data.items():
-                    if df.empty:
-                        continue
-                    df.to_excel(writer, sheet_name=t[:31])  # Excel sheet 名稱限制 31 字
-            st.download_button(
-                label="下載多標的 Excel",
-                data=buff.getvalue(),
-                file_name=f"prices_{start_date}_{end_date}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+if clear:
+    st.session_state.history = []
+    st.experimental_rerun()
 
-# -----------------------------
-# 底部說明
-# -----------------------------
-st.markdown(
-    """
-    **說明**  
-    - 資料來源：`yfinance`（Yahoo Finance）。  
-    - 多標的比較會將每個標的的收盤價標準化到同一起點（第一天=100），方便視覺比較表現。  
-    - 單一標的視圖提供 K 線、雙 MA、成交量、關鍵指標。  
-    """
-)
+# 顯示對話歷史
+for msg in st.session_state.history:
+    with st.chat_message("user" if msg["role"]=="user" else "assistant"):
+        st.markdown(msg["content"])
+
+def build_prompt(query, retrieved):
+    sys = (
+        "你是專業、耐心的中文客服。"
+        "請根據『知識庫』提供可靠且簡潔的回答，必要時提出可行步驟。"
+        "若知識庫無答案，請坦誠說明並提供人工協助管道（例如客服信箱/工單流程的佔位描述）。"
+        "禁止捏造訂單或個資；不要要求提供信用卡等敏感資訊。"
+    )
+    kb_text = "\\n\\n".join([f"[{i+1}] Q: {r['q']}\\nA: {r['a']}" for i, r in enumerate(retrieved)])
+    chat_history = "\\n".join([f"{'客戶' if m['role']=='user' else '客服'}: {m['content']}" for m in st.session_state.history[-6:]])
+    prompt = f"""<|system|>
+{sys}
+<|knowledge_base|>
+{kb_text if kb_text else '（目前沒有可用的知識庫條目）'}
+<|history|>
+{chat_history}
+<|user|>
+{query}
+<|assistant|>"""
+    return prompt
+
+if send and user_input:
+    # 1) 查詢重寫
+    q = rewrite_query(user_input) if use_query_rewrite else user_input
+
+    # 2) 檢索
+    retrieved = []
+    if st.session_state.index is not None and st.session_state.embedder is not None:
+        q_emb = st.session_state.embedder.encode(["query: " + q], convert_to_numpy=True, normalize_embeddings=True)
+        D, I = st.session_state.index.search(q_emb, top_k)
+        for idx in I[0]:
+            if 0 <= idx < len(st.session_state.faq_df):
+                row = st.session_state.faq_df.iloc[idx]
+                retrieved.append({"q": str(row["question"]), "a": str(row["answer"])})
+    else:
+        # 若尚未索引，使用前三筆示例
+        df = st.session_state.faq_df.head(top_k)
+        for _, row in df.iterrows():
+            retrieved.append({"q": str(row["question"]), "a": str(row["answer"])})
+
+    # 3) 建立提示詞
+    prompt = build_prompt(user_input, retrieved)
+
+    st.session_state.history.append({"role":"user", "content": user_input})
+    with st.chat_message("assistant"):
+        if st.session_state.model is None or st.session_state.tokenizer is None:
+            st.warning("尚未載入模型。請在側邊欄點擊『載入/更新 模型』。")
+        else:
+            # 流式輸出
+            holder = st.empty()
+            final_text = ""
+            for partial in generate_stream(prompt, max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p):
+                final_text = partial
+                holder.markdown(final_text)
+            st.session_state.history.append({"role":"assistant", "content": final_text})
+
+st.markdown("---")
+st.caption("小貼士：")
+st.caption("1) 先用 FAQ 做 RAG，可快速上線；2) 之後再用 JDDC/CSDS 等中文客服資料做 SFT 微調；3) 雲端部署可用 Streamlit Cloud / Hugging Face Spaces。")
