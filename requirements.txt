@@ -1,0 +1,8 @@
+streamlit
+yfinance
+plotly
+pandas
+xlsxwriter
+transformers
+torch
+sentencepiece
