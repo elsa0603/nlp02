@@ -1,7 +1,4 @@
 streamlit>=1.36.0
-transformers>=4.42.0
-accelerate>=0.33.0
-sentence-transformers>=3.0.1
-faiss-cpu>=1.8.0
-torch>=2.2.0
-bitsandbytes>=0.43.0 ; platform_system == "Linux"
+pandas>=2.2.0
+scikit-learn>=1.4.0
+jieba>=0.42.1
